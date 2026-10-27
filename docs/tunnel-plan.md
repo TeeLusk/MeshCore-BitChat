@@ -59,11 +59,12 @@ the apps tolerate LoRa-sized delays?) with the hardware you already have.
 |---|---|---|
 | Repeaters never flood `RAW_CUSTOM`; they only forward it along a known direct path, and it has no destination field | `src/Mesh.cpp:292-297`, `:79-107` | Tunnel uses MeshCore **contact datagrams** between the two bridges (flood first, then a learned direct path with ACKs) |
 | Bitchat signature is computed with TTL forced to 0 | `BitchatBridge.cpp:1037-1040` | Bridges may lower TTL without breaking signatures |
-| Android: Noise handshake expires if no progress for **10 s**; retries back off 5/15/30/60 s | `NoiseSessionManager.kt:55`, `AppConstants.kt:139` | Each handshake round trip over LoRa must finish in under 10 s |
-| Android: peer dropped after **3 min** without being seen | `AppConstants.kt:15` | A remote peer's announce must cross LoRa about every 2–2.5 min |
-| Apps reject announces more than 10 min off wall clock; the timestamp is signed | bridge docs | Bridges can't refresh old announces, only relay fresh ones |
+| iOS: Noise handshake expires after **10 s** without progress | `bitchat/Noise/NoiseSecurityConstants.swift:41` | Each handshake round trip over LoRa must finish in under 10 s |
+| iOS: a non-connected peer stays "reachable" only **45 s** after last seen (**60 s** if verified or favorited), then is removed | `bitchat/Services/TransportConfig.swift:179-180`, `BLEPeerRegistry.swift:240-265` | A remote peer's announce must cross LoRa every ~30–40 s. Favorite the remote peer to get 60 s |
+| iOS: every BLE packet more than **±120 s** off the phone's clock is rejected | `TransportConfig.swift:16`, `BLEIngressPacketGuard.swift` | The bridge clock must be within 2 min for its own announces; relayed frames keep the sender's timestamp, so LoRa delay (seconds) is fine |
+| iOS: DMs to a reachable peer are sent at once and kept in an outbox, re-sent until a delivery ack arrives; DMs to an unreachable peer are queued and flushed when it becomes reachable again | `bitchat/Services/MessageRouter.swift:192-262` | Lost tunnel fragments are recovered by the app's own retries; the bridge doesn't need its own retry logic |
+| Android (for a later second phone): handshake 10 s, peer stale after 3 min | `NoiseSessionManager.kt:55`, `AppConstants.kt:15` | iOS is the stricter one; design for iOS |
 | Bridge parser caps payload at 245 B and decompresses | `BitchatProtocol.h:11` | Tunnel needs a raw-bytes tap before parsing |
-| iOS equivalents | **TBD, Slice 1** | Needed only if a phone is iOS |
 
 Airtime per LoRa packet at the US preset (910.525 MHz, SF7, BW 62.5, CR 4/5):
 ~240 ms at 60 B, ~650 ms at 200 B, ~820 ms at 255 B.
@@ -82,14 +83,23 @@ Not ported: the keyboard/LVGL UI (adds variables, not needed).
 (known good) before and after the change.
 
 **Test (E2E):**
-1. Flash, open the USB serial monitor, `BITCHAT_DEBUG=1`.
+1. Build, erase and flash from your laptop (the old Cardputer-ADV firmware
+   saved settings in a different layout, so start clean):
+   ```
+   pio run -e M5stack_cardputer_adv_companion_radio_usb_bitchat -t erase
+   pio run -e M5stack_cardputer_adv_companion_radio_usb_bitchat -t upload
+   pio device monitor -b 115200
+   ```
+   This build has `BITCHAT_DEBUG=1`, so USB serial is a log, not the MeshCore
+   web app. Don't connect the web app during Slice 0.
 2. Open Bitchat on the phone near the Cardputer.
 3. Send `#mesh` "s0 hello" from the phone.
 
 **Pass when:**
+- [ ] The log shows `[LoRa] SX1262 ok, PA config ok`.
 - [ ] The bridge appears in the phone's peer list within 30 s and stays for 10 min.
-- [ ] The serial log shows the `#mesh` message relayed to MeshCore.
-- [ ] The serial log shows the radio initialised at 910.525 / 62.5 / SF7 with no errors.
+  (The bridge takes its clock from the phone's packets; iOS needs it within 2 min.)
+- [ ] The log shows the `#mesh` message relayed to MeshCore.
 
 **If it fails:** it's the port (pins, power-enable via the I2C expander at
 `0x43`, partitions). There's no tunnel code yet.
@@ -124,7 +134,7 @@ Sub-steps, one variable each:
 | 1b | Python peer announces, delay 0 | "virtual-peer" shows in the phone's peer list and stays ≥10 min |
 | 1c | DM, delay 0 (the control) | Phone DMs "1c"; gets "echo: 1c"; the app shows it as encrypted/verified |
 | 1d | Delay sweep 1, 3, 6, 9, 12 s | Record per delay: handshake ok?, DM ok?, time to echo |
-| 1e | Announce interval sweep 60, 120, 150, 180 s | Record: does the peer stay listed? |
+| 1e | Announce interval sweep 20, 30, 40, 50, 70 s, unfavorited then favorited | Record: does the peer stay listed and DM-able? (Expect the cut-off near 45 s / 60 s) |
 
 **Output (go/no-go), written to `docs/tunnel-results.md`:**
 - Largest one-way delay at which handshake + DM still succeed.
@@ -270,8 +280,6 @@ to force the hop).
 
 ## Open questions for the human
 
-1. Phone OS (iOS or Android) and Bitchat app version. This decides which timing
-   constants Slice 1 is validating.
-2. Is there a public MeshCore repeater in range? It could replace buying a third
-   radio for Slice 6.
+1. ~~Phone OS~~: iOS, latest Bitchat.
+2. ~~Public repeater in range~~: none, so Slice 6 needs a third radio.
 3. Second bridge: second Cardputer kit (identical hardware) or Heltec V3 (cheaper)?
