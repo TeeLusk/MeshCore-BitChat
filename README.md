@@ -4,6 +4,19 @@ This is a special experimental Bitchat bridge branch that allows
 you to create a special bridge device that will relay messages
 between Bitchat and MeshCore users.
 
+<!-- jooray-links:start -->
+### More from me
+
+**Related projects**
+
+- [MeshCore-BTC](https://github.com/jooray/MeshCore-BTC): Bitcoin price bot for MeshCore mesh networks
+- [roadstr](https://github.com/jooray/roadstr): road-event reporting over Nostr and MeshCore
+
+**Full project showcase:** [MeshCore-Bitchat Bridge in my project showcase](https://juraj.bednar.io/showcase/#RF-01), or [all my projects](https://juraj.bednar.io/showcase/).
+
+I write about building things on [my blog](https://juraj.bednar.io/en/blog-en/). I also wrote a cypherpunk novel, [Tamers of Entropy](https://tamersofentropy.net/), and there is a [trailer](https://tamersofentropy.net/#trailer).
+<!-- jooray-links:end -->
+
 Read [my blog](https://juraj.bednar.io/en/blog-en/2026/01/18/bridging-bitchat-and-meshcore-resilient-communication-when-you-need-it-most/) and [documentation](docs/bitchat-bridge.md).
 
 Really, read the documentation, but companion_radio_usb_bitchat is
