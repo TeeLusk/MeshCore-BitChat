@@ -529,6 +529,50 @@ private:
      */
     void processPendingParts();
 
+    // ========================================================================
+    // Outbound pacing (MeshCore -> Bitchat)
+    // ========================================================================
+    // bitchat-android 2.1.0+ hides public messages per sender peer ID once they exceed
+    // a token-bucket budget (SpamFilterConfig: burst of 6 messages then 1 per 10 s,
+    // 1200 characters per minute, 2 links per minute). The bridge is a single Bitchat
+    // peer carrying every MeshCore #mesh sender, so a busy channel would be silently
+    // hidden. Messages are queued and released only when the same buckets (with a
+    // small safety margin) would admit them. Timestamps are set at release time,
+    // because the app runs its buckets on message time.
+
+    // Bucket units are chosen so every bucket refills by an integer amount per ms.
+    static const uint32_t TX_MSG_COST = 11000;               // 1 message refills in 11 s (app: 10 s)
+    static const uint32_t TX_MSG_CAPACITY = 6 * TX_MSG_COST; // burst of 6
+    static const uint32_t TX_CHAR_COST = 1000;               // per code point
+    static const uint32_t TX_CHAR_REFILL_PER_MS = 18;        // 18 chars/s (app: 20)
+    static const uint32_t TX_CHAR_CAPACITY = 1200 * TX_CHAR_COST;
+    static const uint32_t TX_LINK_COST = 33000;              // 1 link refills in 33 s (app: 30 s)
+    static const uint32_t TX_LINK_CAPACITY = 2 * TX_LINK_COST;
+
+    uint32_t _txMsgTokens;
+    uint32_t _txCharTokens;
+    uint32_t _txLinkTokens;
+    uint32_t _txLastRefillMs;
+    uint32_t _txDropped;
+
+    /** Queue a formatted MeshCore #mesh text for paced broadcast to Bitchat */
+    void enqueueBitchatOutbound(const char* text);
+
+    /** Release the oldest queued outbound message if the rate buckets admit it */
+    void processOutboundQueue();
+
+    /** Build, sign and broadcast one public MESSAGE to Bitchat */
+    void sendTextToBitchat(const char* text);
+
+public:
+    /** Count Unicode code points in a UTF-8 string (the app's character budget unit) */
+    static size_t countCodePoints(const char* text);
+
+    /** Approximate the app's LinkCounter: scheme URLs, www. hosts and bare domains */
+    static size_t countLinks(const char* text);
+
+private:
+
     /**
      * Parse BitchatMessage TLV payload structure
      *
