@@ -2,7 +2,7 @@
 #include <Mesh.h>
 #include "MyMesh.h"
 
-#ifdef NRF52_SERIES
+#if defined(NRF52_SERIES) && defined(ENABLE_BITCHAT)  // stack diagnostics live in the bitchat sources
 extern "C" void print_stack_usage(void);
 #endif
 
@@ -17,7 +17,12 @@ static uint32_t _atoi(const char* sp) {
 }
 
 // interface manager
+// The meshsolar library (Heltec_mesh_solar target.h) does "#define NONE 1", which
+// breaks InterfaceType::NONE; hide the macro while the header is parsed.
+#pragma push_macro("NONE")
+#undef NONE
 #include <helpers/MultiSerialInterface.h>
+#pragma pop_macro("NONE")
 MultiSerialInterface interface_manager;
 
 // include bluetooth interface
@@ -163,7 +168,7 @@ void setup() {
   Serial.println("board.begin() done");
   Serial.flush();
 
-#ifdef NRF52_SERIES
+#if defined(NRF52_SERIES) && defined(ENABLE_BITCHAT)  // stack diagnostics live in the bitchat sources
   // Paint ISR stack with canary pattern for high-water marking
   extern unsigned long __StackLimit;
   extern unsigned long __StackTop;
@@ -382,7 +387,7 @@ void loop() {
 #endif
   }
 
-#ifdef NRF52_SERIES
+#if defined(NRF52_SERIES) && defined(ENABLE_BITCHAT)  // stack diagnostics live in the bitchat sources
   // Print stack usage every 10 seconds for diagnostics
   static uint32_t last_stack_print = 0;
   if (millis() - last_stack_print >= 10000) {
