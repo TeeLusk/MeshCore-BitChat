@@ -217,8 +217,9 @@ This matches MeshCore's hashtag room key derivation.
 ### Bitchat Protocol Baseline
 
 The bridge is written against the **Bitchat v2.0 binary protocol** (whitepaper dated
-2026-07-06), cross-checked against `permissionlesstech/bitchat-android` `main` as of
-**2026-08-10**.
+2026-07-06, unchanged since), last cross-checked on **2026-10-28** against
+`permissionlesstech/bitchat-android` **v2.2.0** (`20501fdf`) and
+`permissionlesstech/bitchat` (iOS) **v1.8.0** (`30c58eee`).
 
 What the bridge implements:
 
@@ -231,7 +232,9 @@ What the bridge implements:
 | Signing | Ed25519 over the **PKCS#7-padded** encoding with TTL forced to `SYNC_TTL_HOPS = 0` and the signature omitted — still what `toBinaryDataForSigning()` produces. |
 | Padding | Apps switched to *selective* padding (June 2026): only Noise frames are padded on the wire. Receive path is unaffected — decoding tolerates padded and unpadded input, and the signing representation is still padded. |
 | TTL | Outgoing packets use TTL 7 (`MESSAGE_TTL_HOPS`). An announce is only registered as a direct-link neighbour when its TTL equals the app's max, so 8 would make the bridge look like a relayed peer. |
-| Timestamps | The app drops announces more than **10 minutes** off wall clock. The bridge uses, in order: time synced from received Bitchat packets, the MeshCore RTC, then a hardcoded fallback date. |
+| Timestamps | Android drops announces more than **10 minutes** off wall clock; iOS drops any live BLE packet more than **2 minutes** off (`TransportConfig.bleMaxTimestampSkewMs`), and since 1.8.0 also refuses far-future packets in sync replies. The bridge uses, in order: time synced from received Bitchat packets, the MeshCore RTC, then a hardcoded fallback date. |
+| Sender rate (spam filter) | bitchat-android 2.1.0+ hides public messages per sender peer ID beyond a token-bucket budget: burst of 6 then 1 per 10 s, 1200 characters/min, 2 links/min; also near-copies of the sender's own recent text. The bridge is one peer for every MeshCore sender, so MeshCore → Bitchat messages are queued (16 on ESP32, 6 on NRF52) and released under the same buckets with a margin (1 per 11 s, 18 chars/s, 1 link per 33 s). The packet timestamp is set at release. A full queue drops the newest message. |
+| Payload caps | Both apps now cap decoded payloads per type (`PacketPayloadLimits`: MESSAGE 128 KiB, ANNOUNCE 4 KiB, FRAGMENT 1280 B, REQUEST_SYNC 8 KiB). The bridge sends uncompressed, unfragmented messages of at most 200 bytes and small announces, far below the caps. |
 | Ignored types | `FILE_TRANSFER` (0x22) and `VOICE_FRAME` (0x29, live push-to-talk) are dropped rather than bridged to LoRa. Unknown types are ignored. |
 
 Known gaps against current Bitchat builds:
@@ -244,6 +247,18 @@ Known gaps against current Bitchat builds:
 - No Noise session support: private messages to/from the bridge peer are not possible,
   only the `#mesh` channel.
 - Capability bit `PRIVATE_MEDIA` is not advertised (private media transfer unsupported).
+  bitchat-android 2.0.x assigned the capability bits (`BRIDGE` = bit 7, among others); the
+  bridge still sends no capabilities TLV.
+- Rate pacing only covers the rate buckets. The app's repeat checks (the same sender
+  posting near-identical text more than once in 10 minutes) can still hide a MeshCore message
+  that repeats an earlier one, for example the same text from two MeshCore users.
+
+Changes in the apps between 2026-08-10 and 2026-10-28 that need nothing from the bridge:
+signature preimages now reuse the received wire payload (`WirePayload`, so compressed packets
+are no longer re-compressed for verification), duplicate detection hashes type, sender,
+timestamp and full payload, fragment reassembly rejects conflicting indexes, and capability
+bits got assignments. Packet format, message type values, announce TLVs, the peer ID
+rule, the BLE service/characteristic UUIDs and the Noise handshake are unchanged.
 
 ## Release Builds
 

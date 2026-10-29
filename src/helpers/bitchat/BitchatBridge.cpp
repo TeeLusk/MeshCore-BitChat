@@ -87,6 +87,16 @@ static char g_messageContent[2048];          // For message content
 static char g_channelName[32];               // For channel name
 static char g_meshTxContent[200];            // For mesh→bitchat relay
 
+// Outbound (MeshCore -> Bitchat) pacing queue, see BitchatBridge.h "Outbound pacing"
+#if defined(NRF52_PLATFORM)
+  #define BITCHAT_TX_QUEUE_SIZE 6
+#else
+  #define BITCHAT_TX_QUEUE_SIZE 16
+#endif
+static char g_txQueue[BITCHAT_TX_QUEUE_SIZE][sizeof(g_meshTxContent)];
+static size_t g_txQueueHead = 0;   // oldest entry
+static size_t g_txQueueCount = 0;
+
 // PKCS#7 padding for Bitchat protocol signing (must match Android/iOS)
 // Block sizes: 256, 512, 1024, 2048 bytes
 static size_t applyPKCS7Padding(uint8_t* buffer, size_t dataLen, size_t bufferCapacity) {
@@ -154,6 +164,11 @@ BitchatBridge::BitchatBridge(mesh::Mesh& mesh, mesh::LocalIdentity& identity, co
     , _meshChannelConfigured(false)
     , _meshChannelIndex(-1)
     , _messageHistoryHead(0)
+    , _txMsgTokens(TX_MSG_CAPACITY)
+    , _txCharTokens(TX_CHAR_CAPACITY)
+    , _txLinkTokens(TX_LINK_CAPACITY)
+    , _txLastRefillMs(0)
+    , _txDropped(0)
 {
     memset(_defaultChannelName, 0, sizeof(_defaultChannelName));
     strcpy(_defaultChannelName, "mesh");  // Default channel
@@ -544,6 +559,9 @@ void BitchatBridge::loop() {
 
     // Process pending multi-part messages
     processPendingParts();
+
+    // Release paced MeshCore -> Bitchat messages
+    processOutboundQueue();
 
     // Process queued reassembled fragments (deferred to avoid re-entrant call chain)
     if (_hasReassembledMsg) {
@@ -1980,6 +1998,136 @@ void BitchatBridge::onMeshcoreGroupMessage(const mesh::GroupChannel& channel, ui
     // Use global buffer to avoid stack overflow on NRF52
     snprintf(g_meshTxContent, sizeof(g_meshTxContent), "<%s> %s", senderName, text);
 
+    // Paced: bitchat-android hides a sender's messages beyond its rate budget
+    enqueueBitchatOutbound(g_meshTxContent);
+    Serial.println("BITCHAT_BRIDGE: <<< onMeshcoreGroupMessage() EXIT <<<");
+#endif
+}
+
+// ============================================================================
+// Outbound pacing (MeshCore -> Bitchat)
+// ============================================================================
+
+size_t BitchatBridge::countCodePoints(const char* text) {
+    size_t n = 0;
+    for (const uint8_t* p = (const uint8_t*)text; *p; p++) {
+        if ((*p & 0xC0) != 0x80) n++;  // count lead bytes only
+    }
+    return n;
+}
+
+static bool isLinkLabelChar(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-';
+}
+
+static bool isAsciiAlpha(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+// True if s[0..len) is a bare domain: label(.label)*.tld[/...], tld >= 2 letters
+static bool looksLikeBareDomain(const char* s, size_t len) {
+    size_t hostEnd = 0;
+    while (hostEnd < len && s[hostEnd] != '/') hostEnd++;
+    size_t lastDot = hostEnd;
+    size_t dots = 0;
+    size_t labelLen = 0;
+    for (size_t i = 0; i < hostEnd; i++) {
+        if (s[i] == '.') {
+            if (labelLen == 0) return false;
+            lastDot = i;
+            dots++;
+            labelLen = 0;
+        } else if (isLinkLabelChar(s[i])) {
+            labelLen++;
+        } else {
+            return false;
+        }
+    }
+    if (dots == 0 || labelLen == 0) return false;
+    size_t tldLen = hostEnd - lastDot - 1;
+    if (tldLen < 2) return false;
+    for (size_t i = lastDot + 1; i < hostEnd; i++) {
+        if (!isAsciiAlpha(s[i])) return false;
+    }
+    return true;
+}
+
+// Mirrors bitchat-android spam/LinkCounter closely enough for pacing; over-counting
+// only delays a message, under-counting could get it hidden.
+size_t BitchatBridge::countLinks(const char* text) {
+    size_t links = 0;
+    const char* p = text;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (!*p) break;
+        const char* tok = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+        size_t len = p - tok;
+        // trim surrounding punctuation the regex would not consume
+        while (len > 0 && strchr("(<[\"'", *tok)) { tok++; len--; }
+        while (len > 0 && strchr(".,;:!?)>]\"'", tok[len - 1])) len--;
+        if (len == 0) continue;
+        if ((len > 7 && strncasecmp(tok, "http://", 7) == 0) ||
+            (len > 8 && strncasecmp(tok, "https://", 8) == 0) ||
+            (len > 4 && strncasecmp(tok, "www.", 4) == 0)) {
+            links++;
+            continue;
+        }
+        if (memchr(tok, '@', len) != nullptr) continue;  // e-mail addresses are not links
+        if (looksLikeBareDomain(tok, len)) links++;
+    }
+    return links;
+}
+
+void BitchatBridge::enqueueBitchatOutbound(const char* text) {
+    if (g_txQueueCount >= BITCHAT_TX_QUEUE_SIZE) {
+        _txDropped++;
+        BITCHAT_DEBUG_PRINTLN("TX queue full (%u), dropping MeshCore message (dropped=%u)",
+                              (unsigned)BITCHAT_TX_QUEUE_SIZE, (unsigned)_txDropped);
+        return;
+    }
+    size_t slot = (g_txQueueHead + g_txQueueCount) % BITCHAT_TX_QUEUE_SIZE;
+    strncpy(g_txQueue[slot], text, sizeof(g_txQueue[slot]) - 1);
+    g_txQueue[slot][sizeof(g_txQueue[slot]) - 1] = '\0';
+    g_txQueueCount++;
+    BITCHAT_DEBUG_PRINTLN("TX queued for Bitchat (%u waiting)", (unsigned)g_txQueueCount);
+    processOutboundQueue();  // send right away if the budget allows
+}
+
+void BitchatBridge::processOutboundQueue() {
+    uint32_t now = millis();
+    uint32_t elapsed = now - _txLastRefillMs;
+    _txLastRefillMs = now;
+    if (elapsed > 120000) elapsed = 120000;  // every bucket is full after 2 minutes
+
+    uint32_t add = elapsed;  // msg and link buckets refill 1 unit per ms
+    _txMsgTokens = (_txMsgTokens + add > TX_MSG_CAPACITY) ? TX_MSG_CAPACITY : _txMsgTokens + add;
+    _txLinkTokens = (_txLinkTokens + add > TX_LINK_CAPACITY) ? TX_LINK_CAPACITY : _txLinkTokens + add;
+    uint32_t addChars = elapsed * TX_CHAR_REFILL_PER_MS;
+    _txCharTokens = (_txCharTokens + addChars > TX_CHAR_CAPACITY) ? TX_CHAR_CAPACITY : _txCharTokens + addChars;
+
+    if (g_txQueueCount == 0) return;
+
+    const char* text = g_txQueue[g_txQueueHead];
+    uint32_t charCost = (uint32_t)countCodePoints(text) * TX_CHAR_COST;
+    uint32_t linkCost = (uint32_t)countLinks(text) * TX_LINK_COST;
+    if (charCost > TX_CHAR_CAPACITY) charCost = TX_CHAR_CAPACITY;
+    if (linkCost > TX_LINK_CAPACITY) linkCost = TX_LINK_CAPACITY;  // can never fit otherwise
+
+    if (_txMsgTokens < TX_MSG_COST || _txCharTokens < charCost || _txLinkTokens < linkCost) {
+        return;  // wait for the buckets to refill
+    }
+    _txMsgTokens -= TX_MSG_COST;
+    _txCharTokens -= charCost;
+    _txLinkTokens -= linkCost;
+
+    sendTextToBitchat(text);
+    g_txQueueHead = (g_txQueueHead + 1) % BITCHAT_TX_QUEUE_SIZE;
+    g_txQueueCount--;
+}
+
+void BitchatBridge::sendTextToBitchat(const char* text) {
+#if defined(ESP32) || defined(NRF52_PLATFORM)
     // Create Bitchat message - use global buffer to avoid stack overflow
     g_msgBuffer.version = BITCHAT_VERSION;
     g_msgBuffer.type = BITCHAT_MSG_MESSAGE;
@@ -1989,11 +2137,11 @@ void BitchatBridge::onMeshcoreGroupMessage(const mesh::GroupChannel& channel, ui
     g_msgBuffer.setSenderId64(_bitchatPeerId);
 
     // Simple payload format - just copy the text content directly
-    size_t contentLen = strlen(g_meshTxContent);
+    size_t contentLen = strlen(text);
     if (contentLen > BITCHAT_MAX_PAYLOAD_SIZE) {
         contentLen = BITCHAT_MAX_PAYLOAD_SIZE;
     }
-    memcpy(g_msgBuffer.payload, g_meshTxContent, contentLen);
+    memcpy(g_msgBuffer.payload, text, contentLen);
     g_msgBuffer.payloadLength = static_cast<uint16_t>(contentLen);
 
     // Sign the message
@@ -2009,8 +2157,7 @@ void BitchatBridge::onMeshcoreGroupMessage(const mesh::GroupChannel& channel, ui
 
     BITCHAT_PACKETDUMP("BLE_TX_FROM_MESH", g_msgBuffer.payload, g_msgBuffer.payloadLength);
     bool sent = _bleService.broadcastMessage(g_msgBuffer);
-    BITCHAT_DEBUG_PRINTLN("TX to Bitchat: %s (result=%d, added to dedup)", senderName, sent ? 1 : 0);
-    Serial.println("BITCHAT_BRIDGE: <<< onMeshcoreGroupMessage() EXIT <<<");
+    BITCHAT_DEBUG_PRINTLN("TX to Bitchat (result=%d, added to dedup)", sent ? 1 : 0);
 #endif
 }
 
